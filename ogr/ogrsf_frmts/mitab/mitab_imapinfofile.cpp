@@ -21,6 +21,7 @@
 #include <cctype>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 
 #include "cpl_conv.h"
 #include "cpl_error.h"
@@ -211,6 +212,119 @@ OGRFeature *IMapInfoFile::GetNextFeature()
 }
 
 /**********************************************************************
+ *                   CreateTABCollectionFeature()
+ *
+ * Build a TABCollection from an OGRGeometryCollection that mixes point,
+ * line and polygon parts, so that it is written as a single MapInfo
+ * Collection object instead of one feature per part.
+ *
+ * Nested collections are flattened. Returns nullptr when the collection
+ * contains only one kind of geometry, is empty, or contains something
+ * that cannot be represented (curves, ...); the caller then falls back
+ * to writing one feature per part, as before.
+ **********************************************************************/
+static bool CollectCollectionParts(const OGRGeometryCollection *poColl,
+                                   OGRMultiPoint *poPoints,
+                                   OGRMultiLineString *poLines,
+                                   OGRMultiPolygon *poPolygons)
+{
+    for (const auto *poPart : *poColl)
+    {
+        if (poPart == nullptr || poPart->IsEmpty())
+            continue;
+
+        switch (wkbFlatten(poPart->getGeometryType()))
+        {
+            case wkbPoint:
+                poPoints->addGeometry(poPart);
+                break;
+            case wkbLineString:
+                poLines->addGeometry(poPart);
+                break;
+            case wkbPolygon:
+                poPolygons->addGeometry(poPart);
+                break;
+            case wkbMultiPoint:
+            case wkbMultiLineString:
+            case wkbMultiPolygon:
+            case wkbGeometryCollection:
+                if (!CollectCollectionParts(poPart->toGeometryCollection(),
+                                            poPoints, poLines, poPolygons))
+                    return false;
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+static TABFeature *
+CreateTABCollectionFeature(OGRFeature *poFeature,
+                           const OGRGeometryCollection *poColl)
+{
+    auto poPoints = std::make_unique<OGRMultiPoint>();
+    auto poLines = std::make_unique<OGRMultiLineString>();
+    auto poPolygons = std::make_unique<OGRMultiPolygon>();
+
+    if (!CollectCollectionParts(poColl, poPoints.get(), poLines.get(),
+                                poPolygons.get()))
+        return nullptr;
+
+    const int nKinds = (poPoints->getNumGeometries() > 0 ? 1 : 0) +
+                       (poLines->getNumGeometries() > 0 ? 1 : 0) +
+                       (poPolygons->getNumGeometries() > 0 ? 1 : 0);
+    if (nKinds < 2)
+        return nullptr;
+
+    const OGRFeatureDefn *poDefn = poFeature->GetDefnRef();
+    const char *pszStyleString = poFeature->GetStyleString();
+    auto poCollection = std::make_unique<TABCollection>(poDefn);
+
+    if (poPolygons->getNumGeometries() > 0)
+    {
+        auto poRegion = new TABRegion(poDefn);
+        if (poPolygons->getNumGeometries() == 1)
+            poRegion->SetGeometryDirectly(
+                poPolygons->getGeometryRef(0)->clone());
+        else
+            poRegion->SetGeometryDirectly(poPolygons.release());
+        if (pszStyleString)
+        {
+            poRegion->SetPenFromStyleString(pszStyleString);
+            poRegion->SetBrushFromStyleString(pszStyleString);
+        }
+        poCollection->SetRegionDirectly(poRegion);
+    }
+
+    if (poLines->getNumGeometries() > 0)
+    {
+        auto poPline = new TABPolyline(poDefn);
+        if (poLines->getNumGeometries() == 1)
+            poPline->SetGeometryDirectly(poLines->getGeometryRef(0)->clone());
+        else
+            poPline->SetGeometryDirectly(poLines.release());
+        if (pszStyleString)
+            poPline->SetPenFromStyleString(pszStyleString);
+        poCollection->SetPolylineDirectly(poPline);
+    }
+
+    if (poPoints->getNumGeometries() > 0)
+    {
+        auto poMPoint = new TABMultiPoint(poDefn);
+        poMPoint->SetGeometryDirectly(poPoints.release());
+        if (pszStyleString)
+            poMPoint->SetSymbolFromStyleString(pszStyleString);
+        poCollection->SetMultiPointDirectly(poMPoint);
+    }
+
+    if (pszStyleString)
+        poCollection->SetSymbolFromStyleString(pszStyleString);
+
+    return poCollection.release();
+}
+
+/**********************************************************************
  *                   IMapInfoFile::CreateTABFeature()
  *
  * Instantiate a TABFeature* from a OGRFeature* (or NULL on error)
@@ -327,8 +441,10 @@ TABFeature *IMapInfoFile::CreateTABFeature(OGRFeature *poFeature)
             break;
         }
         /*-------------------------------------------------------------
-         * Collection types that are not directly supported... convert
-         * to multiple features in output file through recursive calls.
+         * A collection mixing points, lines and/or polygons is written
+         * as a single MapInfo Collection object. Other collection types
+         * are not directly supported... convert to multiple features in
+         * output file through recursive calls.
          *------------------------------------------------------------*/
         case wkbGeometryCollection:
         case wkbMultiPoint:
@@ -336,6 +452,13 @@ TABFeature *IMapInfoFile::CreateTABFeature(OGRFeature *poFeature)
             OGRErr eStatus = OGRERR_NONE;
             assert(poGeom);  // for clang static analyzer
             OGRGeometryCollection *poColl = poGeom->toGeometryCollection();
+
+            if (wkbFlatten(eGType) == wkbGeometryCollection)
+            {
+                poTABFeature = CreateTABCollectionFeature(poFeature, poColl);
+                if (poTABFeature)
+                    break;
+            }
             auto poTmpFeature = std::unique_ptr<OGRFeature>(poFeature->Clone());
 
             for (int i = 0; eStatus == OGRERR_NONE && poColl != nullptr &&
@@ -361,7 +484,8 @@ TABFeature *IMapInfoFile::CreateTABFeature(OGRFeature *poFeature)
 
     if (poTABFeature)
     {
-        if (poGeom != nullptr)
+        // A TABCollection already carries the geometry of its parts.
+        if (poGeom != nullptr && poTABFeature->GetGeometryRef() == nullptr)
             poTABFeature->SetGeometryDirectly(poGeom->clone());
 
         for (int i = 0; i < poFeature->GetDefnRef()->GetFieldCount(); i++)
