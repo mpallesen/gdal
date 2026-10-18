@@ -3021,3 +3021,64 @@ def test_ogr_mitab_creation_illegal_layer_name(tmp_vsimem):
     ds = ogr.GetDriverByName("MapInfo File").CreateDataSource(tmp_vsimem / "out")
     with pytest.raises(Exception, match="Illegal character"):
         ds.CreateLayer("illegal/with/slash")
+
+
+###############################################################################
+# Test that a GeometryCollection mixing geometry kinds is written as a single
+# MapInfo Collection object (https://github.com/OSGeo/gdal/issues/9194)
+
+
+@pytest.mark.parametrize("ext", ["tab", "mif"])
+def test_ogr_mitab_write_geometry_collection_as_collection(tmp_vsimem, ext):
+
+    filename = tmp_vsimem / f"ogr_mitab_collection.{ext}"
+    ds = ogr.GetDriverByName("MapInfo File").CreateDataSource(filename)
+    lyr = ds.CreateLayer("test")
+    lyr.CreateField(ogr.FieldDefn("id", ogr.OFTInteger))
+
+    # Mixed kinds, including a nested collection: one Collection object
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f.SetField("id", 1)
+    f.SetGeometryDirectly(
+        ogr.CreateGeometryFromWkt(
+            "GEOMETRYCOLLECTION (POINT (1 2), LINESTRING (0 0,1 1,2 0), "
+            "GEOMETRYCOLLECTION (POLYGON ((10 10,10 20,20 20,10 10)), POINT (3 4)))"
+        )
+    )
+    f.SetStyleString("SYMBOL(c:#FF0000);PEN(c:#00FF00,w:2px);BRUSH(fc:#0000FF)")
+    assert lyr.CreateFeature(f) == ogr.OGRERR_NONE
+
+    # Only one kind: still split in one feature per part, as before
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f.SetField("id", 2)
+    f.SetGeometryDirectly(
+        ogr.CreateGeometryFromWkt("GEOMETRYCOLLECTION (POINT (5 6), POINT (7 8))")
+    )
+    assert lyr.CreateFeature(f) == ogr.OGRERR_NONE
+    ds = None
+
+    ds = ogr.Open(filename)
+    lyr = ds.GetLayer(0)
+    assert lyr.GetFeatureCount() == 3
+
+    f = lyr.GetNextFeature()
+    assert f.GetField("id") == 1
+    g = f.GetGeometryRef()
+    assert g.GetGeometryType() == ogr.wkbGeometryCollection
+    assert g.GetGeometryCount() == 3
+    ogrtest.check_feature_geometry(
+        f,
+        "GEOMETRYCOLLECTION (POLYGON ((10 10,10 20,20 20,10 10)),"
+        "LINESTRING (0 0,1 1,2 0),MULTIPOINT ((1 2),(3 4)))",
+    )
+    # The OGR style string of a Collection only exposes the symbol part
+    # (pre-existing behaviour of TABCollection::GetStyleString())
+    style = f.GetStyleString()
+    assert "SYMBOL(" in style, style
+
+    f = lyr.GetNextFeature()
+    assert f.GetField("id") == 2
+    ogrtest.check_feature_geometry(f, "POINT (5 6)")
+    f = lyr.GetNextFeature()
+    assert f.GetField("id") == 2
+    ogrtest.check_feature_geometry(f, "POINT (7 8)")
