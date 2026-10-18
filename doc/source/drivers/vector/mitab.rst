@@ -30,6 +30,11 @@ dataset with one single layer.
 MapInfo coordinate system information is supported for reading and
 writing.
 
+MapInfo Collection objects are read as OGR GeometryCollection. On writing,
+a GeometryCollection that mixes point, line and polygon parts is written as a
+single Collection object (GDAL >= 3.14); a collection with parts of a single
+kind, and a MultiPoint, are still written as one feature per part.
+
 Driver capabilities
 -------------------
 
