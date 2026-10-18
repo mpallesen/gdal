@@ -3033,7 +3033,8 @@ def test_ogr_mitab_write_geometry_collection_as_collection(tmp_vsimem, ext):
 
     filename = tmp_vsimem / f"ogr_mitab_collection.{ext}"
     ds = ogr.GetDriverByName("MapInfo File").CreateDataSource(filename)
-    lyr = ds.CreateLayer("test")
+    # BOUNDS so that TAB coordinates keep enough precision for the comparison below
+    lyr = ds.CreateLayer("test", options=["BOUNDS=-100,-100,100,100"])
     lyr.CreateField(ogr.FieldDefn("id", ogr.OFTInteger))
 
     # Mixed kinds, including a nested collection: one Collection object
@@ -3059,7 +3060,10 @@ def test_ogr_mitab_write_geometry_collection_as_collection(tmp_vsimem, ext):
 
     ds = ogr.Open(filename)
     lyr = ds.GetLayer(0)
-    assert lyr.GetFeatureCount() == 3
+    # Count by iterating: MIFFile::GetFeatureCount() pre-parses the file and
+    # also counts the parts nested in a COLLECTION
+    assert len([f for f in lyr]) == 3
+    lyr.ResetReading()
 
     f = lyr.GetNextFeature()
     assert f.GetField("id") == 1
